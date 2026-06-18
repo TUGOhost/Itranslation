@@ -124,6 +124,10 @@ def main():
                 model=cfg.get("model", "deepseek-v4-pro"),
                 system_prompt=system_prompt, user_prompt=user_prompt,
                 max_tokens=4096,
+                max_retries=cfg.get("max_retries", 3),
+                retry_base_delay=cfg.get("retry_base_delay", 2),
+                retry_max_delay=cfg.get("retry_max_delay", 60),
+                request_timeout=cfg.get("request_timeout", 300),
                 provider=cfg.get("provider", "deepseek"),
             )
 
@@ -219,6 +223,10 @@ def main():
             model=cfg.get("model", "deepseek-v4-pro"),
             system_prompt=sp, user_prompt=up,
             max_tokens=cfg.get("max_tokens_per_chunk", 4096),
+            max_retries=cfg.get("max_retries", 3),
+            retry_base_delay=cfg.get("retry_base_delay", 2),
+            retry_max_delay=cfg.get("retry_max_delay", 60),
+            request_timeout=cfg.get("request_timeout", 300),
             provider=provider,
         )
 
@@ -254,6 +262,10 @@ def main():
                         model=cfg.get("model", "deepseek-v4-pro"),
                         system_prompt=sp, user_prompt=up,
                         max_tokens=cfg.get("max_tokens_per_chunk", 4096),
+                        max_retries=cfg.get("max_retries", 3),
+                        retry_base_delay=cfg.get("retry_base_delay", 2),
+                        retry_max_delay=cfg.get("retry_max_delay", 60),
+                        request_timeout=cfg.get("request_timeout", 300),
                         provider=provider,
                     )
 

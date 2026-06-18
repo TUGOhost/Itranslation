@@ -139,6 +139,7 @@ def translate_chapter(
     if checkpoint.get("content_hash") != content_hash:
         checkpoint = {}
     done_ids = set(checkpoint.get("completed_chunks", []))
+    successful_translations = dict(checkpoint.get("translations", {}))
 
     enable_reflection = config.get("enable_reflection", False)
     reflection_depth = config.get("reflection_depth", 1)
@@ -196,14 +197,15 @@ def translate_chapter(
             _update_consistency(chunk.text, result, glossary, consistency_model, chunk.id)
 
             translations.append(result)
+            successful_translations[chunk.id] = result
 
             # 6. 保存 checkpoint
             if checkpoint_path:
                 _save_checkpoint(
                     checkpoint_path,
-                    {ch.id: t for ch, t in zip(chunks[:len(translations)], translations)},
+                    successful_translations,
                     chapter_title,
-                    len(translations),
+                    len(successful_translations),
                     len(chunks),
                     content_hash,
                 )
@@ -231,13 +233,13 @@ def translate_chapter(
             })
             # 填充占位，保持索引对齐
             translations.append(f"[翻译失败: {error_msg[:80]}]")
-            # 仍然保存 checkpoint（跳过坏块）
-            if checkpoint_path:
+            # 失败块不写入 completed_chunks，后续重跑会自动重试该块。
+            if checkpoint_path and successful_translations:
                 _save_checkpoint(
                     checkpoint_path,
-                    {ch.id: t for ch, t in zip(chunks[:len(translations)], translations)},
+                    successful_translations,
                     chapter_title,
-                    len(translations),
+                    len(successful_translations),
                     len(chunks),
                     content_hash,
                 )
@@ -465,14 +467,34 @@ def _extract_glossary_terms(text: str, glossary: dict) -> list[str]:
 
 
 def _call_with_retry(llm_call: Callable, system_prompt: str, user_prompt: str, chunk_id: str, config: dict) -> tuple[str, dict]:
-    """API 调用包装器。call_api 已内置重试，此处提供友好错误处理。"""
-    try:
-        result, usage = llm_call(system_prompt, user_prompt)
-        if not result or not result.strip():
-            raise ValueError("LLM returned empty response")
-        return result.strip(), usage
-    except Exception as e:
-        raise RuntimeError(f"{chunk_id} 翻译失败: {e}")
+    max_retries = config.get("max_retries", 3)
+    network_max_retries = max(config.get("network_max_retries", max_retries), max_retries)
+    base_delay = config.get("retry_base_delay", 2)
+    max_delay = config.get("retry_max_delay", 60)
+
+    last_error = None
+    attempt = 0
+    last_retry_limit = max_retries
+    while True:
+        try:
+            result, usage = llm_call(system_prompt, user_prompt)
+            if not result or not result.strip():
+                raise ValueError("LLM returned empty response")
+            return result.strip(), usage
+        except Exception as e:
+            last_error = e
+            retry_limit = network_max_retries if getattr(e, "retryable", False) else max_retries
+            last_retry_limit = retry_limit
+
+            if attempt < retry_limit - 1:
+                delay = min(base_delay * (2 ** attempt), max_delay)
+                console.print(f"  [yellow]⚠️ {chunk_id} 第{attempt+1}次失败: {e}，{delay}s 后重试[/yellow]")
+                time.sleep(delay)
+            else:
+                break
+        attempt += 1
+
+    raise RuntimeError(f"{chunk_id} 翻译失败（{last_retry_limit} 次重试后）: {last_error}")
 
 
 def _update_consistency(source: str, target: str, glossary: dict, model: ConsistencyModel, chunk_id: str):

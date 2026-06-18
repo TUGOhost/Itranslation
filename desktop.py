@@ -9,6 +9,8 @@ Itranslation Desktop GUI — NiceGUI + pywebview 原生窗口。
 import sys
 import os
 import json
+import hashlib
+import re
 import time
 import asyncio
 import threading
@@ -18,6 +20,41 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).parent.resolve()
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 sys.path.insert(0, str(PROJECT_ROOT))
+
+
+def _check_env():
+    """Fail early with a clear message when the GUI dependency is missing."""
+    errors = []
+
+    if sys.version_info < (3, 11):
+        errors.append(
+            "Python 版本过低\n"
+            f"当前: {sys.version}\n"
+            "需要: Python 3.11+"
+        )
+
+    try:
+        __import__("nicegui")
+    except ImportError:
+        errors.append(
+            "缺少 NiceGUI 桌面依赖\n"
+            "修复方法:\n"
+            "  uv sync"
+        )
+
+    if errors:
+        print("\n" + "=" * 55)
+        print("  Itranslation — 环境检测")
+        print("=" * 55)
+        for i, err in enumerate(errors, 1):
+            print(f"\n  [{i}] {err}")
+        print("\n" + "=" * 55)
+        print("  修复后重新运行: uv run python desktop.py")
+        print("=" * 55 + "\n")
+        sys.exit(1)
+
+
+_check_env()
 
 from nicegui import ui, app, run
 from config import load_config, calc_cost, MODEL_PRESETS
@@ -312,6 +349,22 @@ def _set_result(container: dict, value):
     container["value"] = value
 
 
+def _failure_message(exc):
+    return str(exc) or type(exc).__name__
+
+
+def _gui_book_hash(book_path) -> str:
+    resolved = str(Path(book_path).expanduser().resolve())
+    return hashlib.sha1(resolved.encode("utf-8")).hexdigest()[:10]
+
+
+def _gui_checkpoint_path(book_path, chapter_index, chapter_title):
+    book_hash = _gui_book_hash(book_path)
+    safe_title = re.sub(r"[^A-Za-z0-9._-]+", "_", chapter_title).strip("._-")
+    safe_title = safe_title[:80] or "chapter"
+    return PROJECT_ROOT / "cache" / f"gui_{book_hash}_{chapter_index:04d}_{safe_title}.json"
+
+
 def _log(msg: str):
     """添加日志。"""
     state["log_lines"].append(msg)
@@ -349,7 +402,7 @@ async def _start_translation():
     # 检查是否有旧的 checkpoint/输出
     book_name = Path(fp).stem
     cache_dir = PROJECT_ROOT / "cache"
-    existing_checkpoints = list(cache_dir.glob(f"checkpoint_*.json"))
+    existing_checkpoints = list(cache_dir.glob(f"gui_{_gui_book_hash(fp)}_*.json"))
     existing_output = list((PROJECT_ROOT / "output" / book_name).glob(f"{book_name}.*")) if (PROJECT_ROOT / "output" / book_name).exists() else []
 
     if existing_checkpoints or existing_output:
@@ -399,8 +452,7 @@ async def _start_translation():
     while t.is_alive():
         await asyncio.sleep(0.25)
 
-    if errors:
-        raise errors[0]
+    failed = errors[0] if errors else None
 
     state["translating"] = False
     state["start_btn"].set_enabled(True)
@@ -410,6 +462,13 @@ async def _start_translation():
 
     if state.get("output_path"):
         state["download_btn"].set_visibility(True)
+
+    if failed:
+        msg = _failure_message(failed)
+        state["current_chapter"] = f"失败: {msg}"
+        state["target_area"].set_text(f"翻译失败: {msg}")
+        _log(f"❌ 翻译失败: {msg}")
+        ui.notify(msg, type="negative")
 
 
 def _run_translation_pipeline():
@@ -508,6 +567,10 @@ def _run_translation_pipeline():
                 model=cfg_local["model"],
                 system_prompt=sp, user_prompt=up,
                 max_tokens=4096,
+                max_retries=cfg_local.get("max_retries", 3),
+                retry_base_delay=cfg_local.get("retry_base_delay", 2),
+                retry_max_delay=cfg_local.get("retry_max_delay", 60),
+                request_timeout=cfg_local.get("request_timeout", 300),
                 provider=state["provider"],
             )
 
@@ -529,6 +592,10 @@ def _run_translation_pipeline():
             model=cfg_local["model"],
             system_prompt=sp, user_prompt=up,
             max_tokens=cfg_local.get("max_tokens_per_chunk", 4096),
+            max_retries=cfg_local.get("max_retries", 3),
+            retry_base_delay=cfg_local.get("retry_base_delay", 2),
+            retry_max_delay=cfg_local.get("retry_max_delay", 60),
+            request_timeout=cfg_local.get("request_timeout", 300),
             provider=state["provider"],
         )
 
@@ -542,9 +609,9 @@ def _run_translation_pipeline():
     if actual_parallel > 1 and len(all_chapter_chunks) > 1:
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
-        def translate_one(title, chunks_list):
+        def translate_one(chapter_index, title, chunks_list):
             cm = ConsistencyModel()
-            checkpoint_path = str(PROJECT_ROOT / "cache" / f"checkpoint_{title}.json")
+            checkpoint_path = str(_gui_checkpoint_path(book_path, chapter_index, title))
             return do_chapter(
                 chapter_title=title, chunks=chunks_list,
                 vector_store=vector_store,
@@ -554,14 +621,17 @@ def _run_translation_pipeline():
             )
 
         with ThreadPoolExecutor(max_workers=actual_parallel) as pool:
-            futures = {pool.submit(translate_one, t, c): t for t, c in all_chapter_chunks}
+            futures = {
+                pool.submit(translate_one, idx, t, c): (t, c)
+                for idx, (t, c) in enumerate(all_chapter_chunks)
+            }
             for fut in as_completed(futures):
                 if state["cancel_flag"]:
                     pool.shutdown(wait=False, cancel_futures=True)
                     return
-                title = futures[fut]
+                title, chunks_list = futures[fut]
                 trans, errs = fut.result()
-                all_translations.append((title, all_chapter_chunks[0][1], trans))
+                all_translations.append((title, chunks_list, trans))
                 all_errors.extend(errs)
                 done_chunks += len(trans)
                 state["progress"] = 0.10 + 0.75 * (done_chunks / max(total_chunks, 1))
@@ -578,10 +648,10 @@ def _run_translation_pipeline():
                 state["cost_dollars"] = cost_val
                 state["elapsed_sec"] = time.time() - start_time
     else:
-        for title, chunks_list in all_chapter_chunks:
+        for ch_idx, (title, chunks_list) in enumerate(all_chapter_chunks):
             if state["cancel_flag"]:
                 return
-            checkpoint_path = str(PROJECT_ROOT / "cache" / f"checkpoint_{title}.json")
+            checkpoint_path = str(_gui_checkpoint_path(book_path, ch_idx, title))
             trans, errs = do_chapter(
                 chapter_title=title, chunks=chunks_list,
                 vector_store=vector_store,

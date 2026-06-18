@@ -111,8 +111,10 @@ DEFAULT_CONFIG = {
     # === 高级 ===
     "batch_delimiter": "\n\n␞␞␞\n\n",
     "max_retries": 3,
+    "network_max_retries": 6,
     "retry_base_delay": 2,
-    "retry_max_delay": 30,
+    "retry_max_delay": 60,
+    "request_timeout": 300,
 }
 
 
